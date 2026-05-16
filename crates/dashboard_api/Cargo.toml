@@ -1,0 +1,36 @@
+[package]
+name = "dashboard_api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dashboard_api"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+config.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+controller = { path = "../controller" }
+monitoring = { path = "../monitoring" }
+analytics = { path = "../analytics" }
+ml_engine = { path = "../ml_engine" }
+optimizer = { path = "../optimizer" }
+resilience = { path = "../resilience" }
+metrics = { path = "../metrics" }
+
+[dev-dependencies]
+tokio-test = "0.4"

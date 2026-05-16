@@ -1,0 +1,34 @@
+{
+  "dashboard": {
+    "title": "RustFlow-AI Dashboard",
+    "panels": [
+      {
+        "title": "Network Bandwidth",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rustflow_bandwidth_bps"
+          }
+        ]
+      },
+      {
+        "title": "Active Flows",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rustflow_active_flows"
+          }
+        ]
+      },
+      {
+        "title": "Latency",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rustflow_latency_ms"
+          }
+        ]
+      }
+    ]
+  }
+}

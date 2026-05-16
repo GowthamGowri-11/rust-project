@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  rustflow-api:
+    build:
+      context: .
+      dockerfile: deployments/Dockerfile
+    container_name: rustflow-api
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      - RUST_LOG=info
+      - API_HOST=0.0.0.0
+      - API_PORT=8080
+      - PROMETHEUS_PORT=9090
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./models:/models:ro
+    networks:
+      - rustflow-net
+    restart: unless-stopped
+
+  rustflow-controller:
+    build:
+      context: .
+      dockerfile: deployments/Dockerfile.controller
+    container_name: rustflow-controller
+    ports:
+      - "6653:6653"
+    environment:
+      - RUST_LOG=info
+      - CONTROLLER_HOST=0.0.0.0
+      - CONTROLLER_PORT=6653
+    networks:
+      - rustflow-net
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rustflow-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./deployments/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - rustflow-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rustflow-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deployments/grafana:/etc/grafana/provisioning:ro
+    networks:
+      - rustflow-net
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+networks:
+  rustflow-net:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.controller
+    container_name: rustflow-controller
+    ports:
+      - "6653:6653"
+    environment:
+      - RUST_LOG=info,controller=debug
+      - CONTROLLER_HOST=0.0.0.0
+      - CONTROLLER_PORT=6653
+    networks:
+      - rustflow-net
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+  mininet:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mininet
+    container_name: rustflow-mininet
+    privileged: true
+    depends_on:
+      - controller
+    environment:
+      - CONTROLLER_IP=controller
+      - CONTROLLER_PORT=6653
+    networks:
+      - rustflow-net
+    volumes:
+      - ./mininet:/mininet
+      - ./logs:/logs
+    stdin_open: true
+    tty: true
+
+networks:
+  rustflow-net:
+    driver: bridge

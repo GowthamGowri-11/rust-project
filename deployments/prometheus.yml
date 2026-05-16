@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'rustflow-api'
+    static_configs:
+      - targets: ['rustflow-api:9090']
+        labels:
+          service: 'dashboard_api'
+
+  - job_name: 'rustflow-controller'
+    static_configs:
+      - targets: ['rustflow-controller:9090']
+        labels:
+          service: 'controller'
