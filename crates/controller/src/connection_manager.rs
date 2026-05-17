@@ -12,6 +12,7 @@ use crate::openflow::*;
 use crate::types::*;
 use crate::error::{ControllerError, Result};
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,9 @@ const MAX_PENDING_OPERATIONS: usize = 1000;
 
 /// Flow operation send timeout (backpressure handling)
 const FLOW_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Flow verification timeout (barrier reply wait)
+const FLOW_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Flow operation command
 #[derive(Debug, Clone)]
@@ -107,6 +111,8 @@ pub struct ManagedConnection {
     state: Arc<RwLock<ConnectionState>>,
     flow_tx: mpsc::Sender<(FlowOperation, oneshot::Sender<Result<()>>)>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    /// CRITICAL FIX #9: XID tracking for flow verification
+    pending_xids: Arc<Mutex<HashMap<u32, oneshot::Sender<Result<()>>>>>,
 }
 
 impl ManagedConnection {
@@ -148,6 +154,7 @@ impl ManagedConnection {
             state: Arc::new(RwLock::new(ConnectionState::Connected)),
             flow_tx,
             shutdown_tx: Some(shutdown_tx),
+            pending_xids: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Spawn message handler
@@ -157,6 +164,7 @@ impl ManagedConnection {
             addr,
             switch_id.clone(),
             conn.state.clone(),
+            conn.pending_xids.clone(),
             shutdown_rx,
         ));
 
@@ -166,6 +174,7 @@ impl ManagedConnection {
             switch_id.clone(),
             conn.xid_counter.clone(),
             conn.state.clone(),
+            conn.pending_xids.clone(),
             flow_rx,
         ));
 
@@ -300,6 +309,7 @@ impl ManagedConnection {
         addr: SocketAddr,
         switch_id: String,
         state: Arc<RwLock<ConnectionState>>,
+        pending_xids: Arc<Mutex<HashMap<u32, oneshot::Sender<Result<()>>>>>,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
         // CRITICAL FIX #7: Cleanup guard for task cancellation safety
@@ -317,10 +327,10 @@ impl ManagedConnection {
                 }
                 result = timeout(READ_TIMEOUT, Self::read_message_safe(&reader)) => {
                     match result {
-                        Ok(Ok((header, _payload))) => {
+                        Ok(Ok((header, payload))) => {
                             debug!(
-                                "Switch {} received message type: {:?}",
-                                switch_id, header.msg_type
+                                "Switch {} received message type: {:?} (xid: {})",
+                                switch_id, header.msg_type, header.xid
                             );
 
                             // Handle specific message types
@@ -338,8 +348,40 @@ impl ManagedConnection {
                                         break;
                                     }
                                 }
+                                MessageType::BarrierReply => {
+                                    // CRITICAL FIX #9: Handle barrier reply for flow verification
+                                    info!("Received barrier reply for switch {} (xid: {})", switch_id, header.xid);
+                                    
+                                    let mut pending = pending_xids.lock().await;
+                                    if let Some(tx) = pending.remove(&header.xid) {
+                                        let _ = tx.send(Ok(()));
+                                        debug!("Flow verification successful for xid: {}", header.xid);
+                                    }
+                                }
                                 MessageType::Error => {
-                                    warn!("Switch {} sent error message", switch_id);
+                                    // CRITICAL FIX #9: Handle error messages
+                                    if let Ok(error_msg) = ErrorMessage::parse(header.clone(), &payload) {
+                                        error!(
+                                            "Switch {} sent error: {} (type: {}, code: {})",
+                                            switch_id,
+                                            error_msg.error_type_str(),
+                                            error_msg.error_type,
+                                            error_msg.error_code
+                                        );
+                                        
+                                        // Notify pending operation if XID matches
+                                        let mut pending = pending_xids.lock().await;
+                                        if let Some(tx) = pending.remove(&header.xid) {
+                                            let _ = tx.send(Err(ControllerError::ProtocolError(format!(
+                                                "Flow operation failed: {} (type: {}, code: {})",
+                                                error_msg.error_type_str(),
+                                                error_msg.error_type,
+                                                error_msg.error_code
+                                            ))));
+                                        }
+                                    } else {
+                                        warn!("Switch {} sent unparseable error message", switch_id);
+                                    }
                                 }
                                 _ => {}
                             }
@@ -361,6 +403,15 @@ impl ManagedConnection {
         // Explicit cleanup before drop
         *state.write().await = ConnectionState::Disconnected;
         
+        // Fail all pending operations
+        let mut pending = pending_xids.lock().await;
+        for (xid, tx) in pending.drain() {
+            let _ = tx.send(Err(ControllerError::ConnectionFailed(
+                "Connection closed".to_string(),
+            )));
+            debug!("Failed pending operation xid: {}", xid);
+        }
+        
         // Flush writer before shutdown
         if let Ok(mut writer_guard) = writer.lock().await {
             let _ = writer_guard.flush().await;
@@ -376,6 +427,7 @@ impl ManagedConnection {
         switch_id: String,
         xid_counter: Arc<std::sync::atomic::AtomicU32>,
         state: Arc<RwLock<ConnectionState>>,
+        pending_xids: Arc<Mutex<HashMap<u32, oneshot::Sender<Result<()>>>>>,
         mut flow_rx: mpsc::Receiver<(FlowOperation, oneshot::Sender<Result<()>>)>,
     ) {
         // CRITICAL FIX #7: Cleanup guard for task cancellation safety
@@ -391,11 +443,12 @@ impl ManagedConnection {
             
             let result = match current_state {
                 ConnectionState::Connected | ConnectionState::Authenticated => {
-                    // Connection is healthy, execute operation
-                    Self::execute_flow_operation(
+                    // Connection is healthy, execute operation with verification
+                    Self::execute_flow_operation_verified(
                         &writer,
                         &switch_id,
                         &xid_counter,
+                        &pending_xids,
                         operation,
                     )
                     .await
@@ -495,6 +548,88 @@ impl ManagedConnection {
         );
 
         Ok(())
+    }
+
+    /// CRITICAL FIX #9: Execute flow operation with verification
+    /// Sends flow mod, then barrier request, waits for barrier reply
+    async fn execute_flow_operation_verified(
+        writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+        switch_id: &str,
+        xid_counter: &Arc<std::sync::atomic::AtomicU32>,
+        pending_xids: &Arc<Mutex<HashMap<u32, oneshot::Sender<Result<()>>>>>,
+        operation: FlowOperation,
+    ) -> Result<()> {
+        // Send flow operation
+        Self::execute_flow_operation(writer, switch_id, xid_counter, operation).await?;
+
+        // Generate XID for barrier request
+        let barrier_xid = loop {
+            let xid = xid_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if xid == 0 {
+                continue;
+            }
+            if xid == u32::MAX {
+                xid_counter.store(1, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            }
+            break xid;
+        };
+
+        // Create verification channel
+        let (verify_tx, verify_rx) = oneshot::channel();
+        
+        // Register pending XID
+        {
+            let mut pending = pending_xids.lock().await;
+            pending.insert(barrier_xid, verify_tx);
+        }
+
+        // Send barrier request
+        let barrier = BarrierMessage::new_request(barrier_xid);
+        Self::write_message_safe(writer, &barrier.to_bytes()).await?;
+
+        info!(
+            "Sent barrier request for switch {} (xid: {})",
+            switch_id, barrier_xid
+        );
+
+        // Wait for barrier reply with timeout
+        match timeout(FLOW_VERIFY_TIMEOUT, verify_rx).await {
+            Ok(Ok(Ok(()))) => {
+                info!(
+                    "Flow operation verified for switch {} (barrier xid: {})",
+                    switch_id, barrier_xid
+                );
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => {
+                error!(
+                    "Flow operation failed for switch {} (barrier xid: {}): {}",
+                    switch_id, barrier_xid, e
+                );
+                Err(e)
+            }
+            Ok(Err(_)) => {
+                // Channel closed
+                let mut pending = pending_xids.lock().await;
+                pending.remove(&barrier_xid);
+                Err(ControllerError::ConnectionFailed(
+                    "Verification channel closed".to_string(),
+                ))
+            }
+            Err(_) => {
+                // Timeout
+                warn!(
+                    "Flow verification timeout for switch {} (barrier xid: {})",
+                    switch_id, barrier_xid
+                );
+                let mut pending = pending_xids.lock().await;
+                pending.remove(&barrier_xid);
+                Err(ControllerError::ConnectionFailed(
+                    "Flow verification timeout".to_string(),
+                ))
+            }
+        }
     }
 
     /// Create FlowMod message from FlowRule with COMPLETE match and action encoding

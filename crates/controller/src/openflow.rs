@@ -546,12 +546,93 @@ impl FlowModMessage {
     }
 }
 
+/// Barrier Request/Reply Message (for flow installation verification)
+#[derive(Debug, Clone)]
+pub struct BarrierMessage {
+    pub header: OpenFlowHeader,
+}
+
+impl BarrierMessage {
+    pub fn new_request(xid: u32) -> Self {
+        let mut header = OpenFlowHeader::new(MessageType::BarrierRequest, xid);
+        header.length = OpenFlowHeader::HEADER_SIZE as u16;
+        Self { header }
+    }
+
+    pub fn new_reply(xid: u32) -> Self {
+        let mut header = OpenFlowHeader::new(MessageType::BarrierReply, xid);
+        header.length = OpenFlowHeader::HEADER_SIZE as u16;
+        Self { header }
+    }
+
+    pub fn to_bytes(&self) -> Bytes {
+        self.header.to_bytes()
+    }
+}
+
+/// OpenFlow Error Message
+#[derive(Debug, Clone)]
+pub struct ErrorMessage {
+    pub header: OpenFlowHeader,
+    pub error_type: u16,
+    pub error_code: u16,
+    pub data: Vec<u8>,
+}
+
+impl ErrorMessage {
+    pub fn parse(header: OpenFlowHeader, payload: &[u8]) -> OpenFlowResult<Self> {
+        if payload.len() < 4 {
+            return Err(OpenFlowError::ParseError(
+                "Error message too short".to_string(),
+            ));
+        }
+
+        let error_type = u16::from_be_bytes([payload[0], payload[1]]);
+        let error_code = u16::from_be_bytes([payload[2], payload[3]]);
+        let data = if payload.len() > 4 {
+            payload[4..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            header,
+            error_type,
+            error_code,
+            data,
+        })
+    }
+
+    pub fn error_type_str(&self) -> &'static str {
+        match self.error_type {
+            0 => "HELLO_FAILED",
+            1 => "BAD_REQUEST",
+            2 => "BAD_ACTION",
+            3 => "BAD_INSTRUCTION",
+            4 => "BAD_MATCH",
+            5 => "FLOW_MOD_FAILED",
+            6 => "GROUP_MOD_FAILED",
+            7 => "PORT_MOD_FAILED",
+            8 => "TABLE_MOD_FAILED",
+            9 => "QUEUE_OP_FAILED",
+            10 => "SWITCH_CONFIG_FAILED",
+            11 => "ROLE_REQUEST_FAILED",
+            12 => "METER_MOD_FAILED",
+            13 => "TABLE_FEATURES_FAILED",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum OpenFlowMessage {
     Hello(HelloMessage),
     FeaturesReply(FeaturesReplyMessage),
     FlowMod(FlowModMessage),
     EchoReply(OpenFlowHeader),
+    BarrierRequest(BarrierMessage),
+    BarrierReply(BarrierMessage),
+    Error(ErrorMessage),
 }
 
 impl OpenFlowMessage {
@@ -561,6 +642,12 @@ impl OpenFlowMessage {
             OpenFlowMessage::FeaturesReply(msg) => msg.to_bytes(),
             OpenFlowMessage::FlowMod(msg) => msg.to_bytes(),
             OpenFlowMessage::EchoReply(header) => header.to_bytes(),
+            OpenFlowMessage::BarrierRequest(msg) => msg.to_bytes(),
+            OpenFlowMessage::BarrierReply(msg) => msg.to_bytes(),
+            OpenFlowMessage::Error(_) => {
+                // Error messages are only parsed, not generated
+                panic!("Cannot serialize Error message");
+            }
         }
     }
 
