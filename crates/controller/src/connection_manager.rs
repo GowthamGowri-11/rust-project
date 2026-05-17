@@ -124,6 +124,7 @@ impl ManagedConnection {
             stream.clone(),
             switch_id.clone(),
             conn.xid_counter.clone(),
+            conn.state.clone(), // Pass state for validation
             flow_rx,
         ));
 
@@ -304,16 +305,47 @@ impl ManagedConnection {
         stream: Arc<RwLock<TcpStream>>,
         switch_id: String,
         xid_counter: Arc<parking_lot::Mutex<u32>>,
+        state: Arc<RwLock<ConnectionState>>,
         mut flow_rx: mpsc::Receiver<(FlowOperation, oneshot::Sender<Result<()>>)>,
     ) {
         while let Some((operation, result_tx)) = flow_rx.recv().await {
-            let result = Self::execute_flow_operation(
-                &stream,
-                &switch_id,
-                &xid_counter,
-                operation,
-            )
-            .await;
+            // CRITICAL FIX: Validate connection state before executing operation
+            let current_state = *state.read().await;
+            
+            let result = match current_state {
+                ConnectionState::Connected | ConnectionState::Authenticated => {
+                    // Connection is healthy, execute operation
+                    Self::execute_flow_operation(
+                        &stream,
+                        &switch_id,
+                        &xid_counter,
+                        operation,
+                    )
+                    .await
+                }
+                ConnectionState::Disconnected | ConnectionState::Failed => {
+                    // Connection is dead, reject operation immediately
+                    warn!(
+                        "Rejecting flow operation for switch {} - connection state: {:?}",
+                        switch_id, current_state
+                    );
+                    Err(ControllerError::ConnectionFailed(format!(
+                        "Switch {} is not connected (state: {:?})",
+                        switch_id, current_state
+                    )))
+                }
+                ConnectionState::Connecting => {
+                    // Connection is still establishing, reject for now
+                    warn!(
+                        "Rejecting flow operation for switch {} - still connecting",
+                        switch_id
+                    );
+                    Err(ControllerError::ConnectionFailed(format!(
+                        "Switch {} is still connecting",
+                        switch_id
+                    )))
+                }
+            };
 
             // Send result back
             let _ = result_tx.send(result);
