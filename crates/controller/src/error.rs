@@ -21,6 +21,15 @@ pub enum ControllerError {
     #[error("Invalid flow rule: {0}")]
     InvalidFlowRule(String),
 
+    #[error("Maximum connections reached")]
+    TooManyConnections,
+
+    #[error("Message too large: {0} bytes")]
+    MessageTooLarge(usize),
+
+    #[error("Timeout: {0}")]
+    Timeout(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
