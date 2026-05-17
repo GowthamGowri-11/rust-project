@@ -68,7 +68,7 @@ pub struct ManagedConnection {
     addr: SocketAddr,
     pub switch_id: String,
     pub datapath_id: u64,
-    xid_counter: Arc<parking_lot::Mutex<u32>>,
+    xid_counter: Arc<std::sync::atomic::AtomicU32>, // Changed to atomic for thread-safe increment
     state: Arc<RwLock<ConnectionState>>,
     flow_tx: mpsc::Sender<(FlowOperation, oneshot::Sender<Result<()>>)>,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -104,7 +104,7 @@ impl ManagedConnection {
             addr,
             switch_id: switch_id.clone(),
             datapath_id,
-            xid_counter: Arc::new(parking_lot::Mutex::new(1)),
+            xid_counter: Arc::new(std::sync::atomic::AtomicU32::new(1)), // Start at 1 (0 is reserved)
             state: Arc::new(RwLock::new(ConnectionState::Connected)),
             flow_tx,
             shutdown_tx: Some(shutdown_tx),
@@ -304,7 +304,7 @@ impl ManagedConnection {
     async fn flow_operation_handler(
         stream: Arc<RwLock<TcpStream>>,
         switch_id: String,
-        xid_counter: Arc<parking_lot::Mutex<u32>>,
+        xid_counter: Arc<std::sync::atomic::AtomicU32>,
         state: Arc<RwLock<ConnectionState>>,
         mut flow_rx: mpsc::Receiver<(FlowOperation, oneshot::Sender<Result<()>>)>,
     ) {
@@ -358,26 +358,39 @@ impl ManagedConnection {
     async fn execute_flow_operation(
         stream: &Arc<RwLock<TcpStream>>,
         switch_id: &str,
-        xid_counter: &Arc<parking_lot::Mutex<u32>>,
+        xid_counter: &Arc<std::sync::atomic::AtomicU32>,
         operation: FlowOperation,
     ) -> Result<()> {
-        let xid = {
-            let mut counter = xid_counter.lock();
-            let xid = *counter;
-            *counter = counter.wrapping_add(1);
-            xid
+        // CRITICAL FIX: Atomic XID generation with proper handling
+        let xid = loop {
+            let xid = xid_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            
+            // Skip reserved XID (0 is invalid in OpenFlow)
+            if xid == 0 {
+                continue;
+            }
+            
+            // Check for wrap-around (very rare with u32)
+            if xid == u32::MAX {
+                // Reset counter to 1 (skip 0)
+                xid_counter.store(1, std::sync::atomic::Ordering::SeqCst);
+                warn!("XID counter wrapped around for switch {}", switch_id);
+                continue;
+            }
+            
+            break xid;
         };
 
         let msg = match &operation {
             FlowOperation::Add(rule) => {
                 info!(
-                    "Installing flow {:?} on switch {} (priority: {})",
-                    rule.id, switch_id, rule.priority
+                    "Installing flow {:?} on switch {} (priority: {}, xid: {})",
+                    rule.id, switch_id, rule.priority, xid
                 );
                 Self::create_flow_mod(rule, 0, xid) // ADD command
             }
             FlowOperation::Modify(rule) => {
-                info!("Modifying flow {:?} on switch {}", rule.id, switch_id);
+                info!("Modifying flow {:?} on switch {} (xid: {})", rule.id, switch_id, xid);
                 Self::create_flow_mod(rule, 1, xid) // MODIFY command
             }
             FlowOperation::Delete(flow_id) => {
