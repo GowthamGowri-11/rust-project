@@ -15,9 +15,10 @@ use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{mpsc, oneshot, RwLock, Mutex};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -64,11 +65,12 @@ pub enum ConnectionState {
 
 /// Managed switch connection with flow transmission capability
 pub struct ManagedConnection {
-    stream: Arc<RwLock<TcpStream>>,
+    reader: Arc<Mutex<BufReader<OwnedReadHalf>>>,
+    writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
     addr: SocketAddr,
     pub switch_id: String,
     pub datapath_id: u64,
-    xid_counter: Arc<std::sync::atomic::AtomicU32>, // Changed to atomic for thread-safe increment
+    xid_counter: Arc<std::sync::atomic::AtomicU32>,
     state: Arc<RwLock<ConnectionState>>,
     flow_tx: mpsc::Sender<(FlowOperation, oneshot::Sender<Result<()>>)>,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -80,14 +82,18 @@ impl ManagedConnection {
         stream: TcpStream,
         addr: SocketAddr,
     ) -> Result<Self> {
-        let stream = Arc::new(RwLock::new(stream));
+        // Split stream for independent read/write operations
+        let (read_half, write_half) = stream.into_split();
+        let reader = Arc::new(Mutex::new(BufReader::new(read_half)));
+        let writer = Arc::new(Mutex::new(BufWriter::new(write_half)));
+        
         let (flow_tx, flow_rx) = mpsc::channel(MAX_PENDING_OPERATIONS);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         // Perform handshake with timeout
         let datapath_id = timeout(
             CONNECTION_TIMEOUT,
-            Self::perform_handshake(stream.clone(), addr),
+            Self::perform_handshake(reader.clone(), writer.clone(), addr),
         )
         .await
         .map_err(|_| ControllerError::ConnectionFailed("Handshake timeout".to_string()))??;
@@ -100,11 +106,12 @@ impl ManagedConnection {
         );
 
         let conn = Self {
-            stream: stream.clone(),
+            reader: reader.clone(),
+            writer: writer.clone(),
             addr,
             switch_id: switch_id.clone(),
             datapath_id,
-            xid_counter: Arc::new(std::sync::atomic::AtomicU32::new(1)), // Start at 1 (0 is reserved)
+            xid_counter: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             state: Arc::new(RwLock::new(ConnectionState::Connected)),
             flow_tx,
             shutdown_tx: Some(shutdown_tx),
@@ -112,7 +119,8 @@ impl ManagedConnection {
 
         // Spawn message handler
         tokio::spawn(Self::message_handler(
-            stream.clone(),
+            reader.clone(),
+            writer.clone(),
             addr,
             switch_id.clone(),
             conn.state.clone(),
@@ -121,10 +129,10 @@ impl ManagedConnection {
 
         // Spawn flow operation handler
         tokio::spawn(Self::flow_operation_handler(
-            stream.clone(),
+            writer.clone(),
             switch_id.clone(),
             conn.xid_counter.clone(),
-            conn.state.clone(), // Pass state for validation
+            conn.state.clone(),
             flow_rx,
         ));
 
@@ -133,25 +141,21 @@ impl ManagedConnection {
 
     /// Perform OpenFlow handshake
     async fn perform_handshake(
-        stream: Arc<RwLock<TcpStream>>,
+        reader: Arc<Mutex<BufReader<OwnedReadHalf>>>,
+        writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
         addr: SocketAddr,
     ) -> Result<u64> {
-        let mut stream_guard = stream.write().await;
-
         // Send HELLO
         let hello = HelloMessage::new(1);
         let hello_bytes = hello.to_bytes();
         
-        timeout(WRITE_TIMEOUT, stream_guard.write_all(&hello_bytes))
-            .await
-            .map_err(|_| ControllerError::ConnectionFailed("Write timeout".to_string()))??;
-
+        Self::write_message_safe(&writer, &hello_bytes).await?;
         debug!("Sent HELLO to {}", addr);
 
         // Wait for HELLO response
         let (header, _) = timeout(
             READ_TIMEOUT,
-            Self::receive_message_internal(&mut *stream_guard),
+            Self::read_message_safe(&reader),
         )
         .await
         .map_err(|_| ControllerError::ConnectionFailed("Read timeout".to_string()))??;
@@ -168,14 +172,12 @@ impl ManagedConnection {
         let features_req = OpenFlowHeader::new(MessageType::FeaturesRequest, 2);
         let features_bytes = features_req.to_bytes();
         
-        timeout(WRITE_TIMEOUT, stream_guard.write_all(&features_bytes))
-            .await
-            .map_err(|_| ControllerError::ConnectionFailed("Write timeout".to_string()))??;
+        Self::write_message_safe(&writer, &features_bytes).await?;
 
         // Wait for FEATURES_REPLY
         let (header, payload) = timeout(
             READ_TIMEOUT,
-            Self::receive_message_internal(&mut *stream_guard),
+            Self::read_message_safe(&reader),
         )
         .await
         .map_err(|_| ControllerError::ConnectionFailed("Read timeout".to_string()))??;
@@ -201,12 +203,37 @@ impl ManagedConnection {
         Ok(datapath_id)
     }
 
-    /// Receive message with size validation
-    async fn receive_message_internal(
-        stream: &mut TcpStream,
+    /// CRITICAL FIX #4: Safe message write with buffering and flush
+    /// Prevents partial write corruption by using buffered I/O
+    async fn write_message_safe(
+        writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+        message: &[u8],
+    ) -> Result<()> {
+        let mut writer_guard = writer.lock().await;
+        
+        // Write with timeout
+        timeout(WRITE_TIMEOUT, writer_guard.write_all(message))
+            .await
+            .map_err(|_| ControllerError::ConnectionFailed("Write timeout".to_string()))??;
+        
+        // CRITICAL: Flush to ensure complete transmission
+        timeout(WRITE_TIMEOUT, writer_guard.flush())
+            .await
+            .map_err(|_| ControllerError::ConnectionFailed("Flush timeout".to_string()))??;
+        
+        Ok(())
+    }
+
+    /// CRITICAL FIX #5: Safe message read with buffering
+    /// Handles partial reads and message boundaries correctly
+    async fn read_message_safe(
+        reader: &Arc<Mutex<BufReader<OwnedReadHalf>>>,
     ) -> Result<(OpenFlowHeader, Vec<u8>)> {
+        let mut reader_guard = reader.lock().await;
+        
+        // Read header (8 bytes)
         let mut header_buf = [0u8; 8];
-        stream.read_exact(&mut header_buf).await?;
+        reader_guard.read_exact(&mut header_buf).await?;
 
         let header = OpenFlowHeader::parse(&header_buf)
             .map_err(|e| ControllerError::ProtocolError(e.to_string()))?;
@@ -224,9 +251,10 @@ impl ManagedConnection {
             return Err(ControllerError::MessageTooLarge(payload_len));
         }
 
+        // Read payload (handles partial reads automatically via read_exact)
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
-            stream.read_exact(&mut payload).await?;
+            reader_guard.read_exact(&mut payload).await?;
         }
 
         Ok((header, payload))
@@ -234,7 +262,8 @@ impl ManagedConnection {
 
     /// Message handler task
     async fn message_handler(
-        stream: Arc<RwLock<TcpStream>>,
+        reader: Arc<Mutex<BufReader<OwnedReadHalf>>>,
+        writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
         addr: SocketAddr,
         switch_id: String,
         state: Arc<RwLock<ConnectionState>>,
@@ -246,13 +275,7 @@ impl ManagedConnection {
                     info!("Shutting down message handler for switch {}", switch_id);
                     break;
                 }
-                result = async {
-                    let mut stream_guard = stream.write().await;
-                    timeout(
-                        READ_TIMEOUT,
-                        Self::receive_message_internal(&mut *stream_guard),
-                    ).await
-                } => {
+                result = timeout(READ_TIMEOUT, Self::read_message_safe(&reader)) => {
                     match result {
                         Ok(Ok((header, _payload))) => {
                             debug!(
@@ -270,8 +293,7 @@ impl ManagedConnection {
                                     );
                                     reply.length = 8;
                                     
-                                    let mut stream_guard = stream.write().await;
-                                    if let Err(e) = stream_guard.write_all(&reply.to_bytes()).await {
+                                    if let Err(e) = Self::write_message_safe(&writer, &reply.to_bytes()).await {
                                         error!("Failed to send echo reply: {}", e);
                                         break;
                                     }
@@ -302,7 +324,7 @@ impl ManagedConnection {
 
     /// Flow operation handler task
     async fn flow_operation_handler(
-        stream: Arc<RwLock<TcpStream>>,
+        writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
         switch_id: String,
         xid_counter: Arc<std::sync::atomic::AtomicU32>,
         state: Arc<RwLock<ConnectionState>>,
@@ -316,7 +338,7 @@ impl ManagedConnection {
                 ConnectionState::Connected | ConnectionState::Authenticated => {
                     // Connection is healthy, execute operation
                     Self::execute_flow_operation(
-                        &stream,
+                        &writer,
                         &switch_id,
                         &xid_counter,
                         operation,
@@ -356,7 +378,7 @@ impl ManagedConnection {
 
     /// Execute flow operation - ACTUALLY SEND TO SWITCH
     async fn execute_flow_operation(
-        stream: &Arc<RwLock<TcpStream>>,
+        writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
         switch_id: &str,
         xid_counter: &Arc<std::sync::atomic::AtomicU32>,
         operation: FlowOperation,
@@ -401,11 +423,8 @@ impl ManagedConnection {
 
         let bytes = msg.to_bytes();
 
-        // Send with timeout
-        let mut stream_guard = stream.write().await;
-        timeout(WRITE_TIMEOUT, stream_guard.write_all(&bytes))
-            .await
-            .map_err(|_| ControllerError::ConnectionFailed("Write timeout".to_string()))??;
+        // CRITICAL FIX #4: Use safe write with buffering and flush
+        Self::write_message_safe(writer, &bytes).await?;
 
         info!(
             "Successfully sent flow operation to switch {} (xid: {})",
