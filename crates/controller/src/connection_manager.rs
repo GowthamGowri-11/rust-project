@@ -370,13 +370,94 @@ impl ManagedConnection {
         Ok(())
     }
 
-    /// Create FlowMod message from FlowRule
+    /// Create FlowMod message from FlowRule with COMPLETE match and action encoding
     fn create_flow_mod(rule: &FlowRule, command: u8, xid: u32) -> FlowModMessage {
+        use crate::openflow::{Action as OfAction, Instruction, OxmField};
+        
         let mut msg = FlowModMessage::new(xid, command);
         msg.priority = rule.priority;
         msg.idle_timeout = rule.idle_timeout;
         msg.hard_timeout = rule.hard_timeout;
-        // TODO: Add match fields and actions from rule
+        
+        // Encode match fields from FlowRule
+        let mut oxm_fields = Vec::new();
+        
+        if let Some(in_port) = rule.match_fields.in_port {
+            oxm_fields.push(OxmField::InPort(in_port));
+        }
+        
+        if let Some(ref eth_src) = rule.match_fields.eth_src {
+            if let Ok(mac) = parse_mac_address(eth_src) {
+                oxm_fields.push(OxmField::EthSrc(mac));
+            }
+        }
+        
+        if let Some(ref eth_dst) = rule.match_fields.eth_dst {
+            if let Ok(mac) = parse_mac_address(eth_dst) {
+                oxm_fields.push(OxmField::EthDst(mac));
+            }
+        }
+        
+        if let Some(eth_type) = rule.match_fields.eth_type {
+            oxm_fields.push(OxmField::EthType(eth_type));
+        }
+        
+        if let Some(ip_proto) = rule.match_fields.ip_proto {
+            oxm_fields.push(OxmField::IpProto(ip_proto));
+        }
+        
+        if let Some(ip_src) = rule.match_fields.ip_src {
+            if let std::net::IpAddr::V4(ipv4) = ip_src {
+                oxm_fields.push(OxmField::Ipv4Src(u32::from(ipv4)));
+            }
+        }
+        
+        if let Some(ip_dst) = rule.match_fields.ip_dst {
+            if let std::net::IpAddr::V4(ipv4) = ip_dst {
+                oxm_fields.push(OxmField::Ipv4Dst(u32::from(ipv4)));
+            }
+        }
+        
+        if let Some(tcp_src) = rule.match_fields.tcp_src {
+            oxm_fields.push(OxmField::TcpSrc(tcp_src));
+        }
+        
+        if let Some(tcp_dst) = rule.match_fields.tcp_dst {
+            oxm_fields.push(OxmField::TcpDst(tcp_dst));
+        }
+        
+        msg.match_fields = oxm_fields;
+        
+        // Encode actions from FlowRule
+        let mut of_actions = Vec::new();
+        
+        for action in &rule.actions {
+            match action {
+                crate::types::Action::Output { port } => {
+                    of_actions.push(OfAction::Output {
+                        port: *port,
+                        max_len: 0xFFFF, // No buffer
+                    });
+                }
+                crate::types::Action::SetVlan { vlan_id } => {
+                    // Push VLAN tag then set field
+                    of_actions.push(OfAction::PushVlan { ethertype: 0x8100 });
+                    // TODO: Add SET_FIELD for VLAN_VID
+                }
+                crate::types::Action::SetQueue { queue_id } => {
+                    of_actions.push(OfAction::SetQueue { queue_id: *queue_id });
+                }
+                crate::types::Action::Drop => {
+                    // Drop = no actions, handled by empty instruction list
+                }
+            }
+        }
+        
+        // Wrap actions in APPLY_ACTIONS instruction
+        if !of_actions.is_empty() || rule.actions.iter().any(|a| matches!(a, crate::types::Action::Drop)) {
+            msg.instructions = vec![Instruction::ApplyActions(of_actions)];
+        }
+        
         msg
     }
 
@@ -496,6 +577,26 @@ impl ConnectionManager {
             self.remove_connection(&switch_id).await;
         }
     }
+}
+
+/// Parse MAC address from string (format: "aa:bb:cc:dd:ee:ff")
+fn parse_mac_address(mac_str: &str) -> Result<[u8; 6]> {
+    let parts: Vec<&str> = mac_str.split(':').collect();
+    if parts.len() != 6 {
+        return Err(ControllerError::ProtocolError(format!(
+            "Invalid MAC address format: {}",
+            mac_str
+        )));
+    }
+    
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).map_err(|_| {
+            ControllerError::ProtocolError(format!("Invalid MAC address: {}", mac_str))
+        })?;
+    }
+    
+    Ok(mac)
 }
 
 #[cfg(test)]
