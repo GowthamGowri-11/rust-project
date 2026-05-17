@@ -3,6 +3,7 @@ use axum::{
     Router,
 };
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -10,9 +11,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod config;
 mod handlers;
 mod state;
+mod security;
 
 use config::AppConfig;
 use state::AppState;
+use security::SecurityConfig;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,6 +32,12 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let config = AppConfig::load_or_default();
     info!("Configuration loaded: API will listen on {}:{}", config.api.host, config.api.port);
+
+    // Initialize security
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .unwrap_or_else(|_| "default-secret-change-in-production".to_string());
+    let security_config = Arc::new(SecurityConfig::default_with_secret(jwt_secret));
+    info!("Security initialized with JWT authentication");
 
     // Initialize metrics
     metrics::PrometheusExporter::init();

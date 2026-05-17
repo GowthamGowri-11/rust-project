@@ -23,6 +23,9 @@ hyper.workspace = true
 config.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+jsonwebtoken.workspace = true
+sha2.workspace = true
+validator.workspace = true
 
 controller = { path = "../controller" }
 monitoring = { path = "../monitoring" }

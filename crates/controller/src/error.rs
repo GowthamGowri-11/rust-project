@@ -1,9 +1,13 @@
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Error, Debug)]
 pub enum ControllerError {
     #[error("Switch not found: {0}")]
     SwitchNotFound(String),
+
+    #[error("Flow not found: {0}")]
+    FlowNotFound(Uuid),
 
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
