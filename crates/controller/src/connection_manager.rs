@@ -37,6 +37,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum pending flow operations per switch
 const MAX_PENDING_OPERATIONS: usize = 1000;
 
+/// Flow operation send timeout (backpressure handling)
+const FLOW_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Flow operation command
 #[derive(Debug, Clone)]
 pub enum FlowOperation {
@@ -61,6 +64,36 @@ pub enum ConnectionState {
     Authenticated,
     Disconnected,
     Failed,
+}
+
+/// CRITICAL FIX #7: Cleanup guard for task cancellation safety
+/// Ensures resources are properly cleaned up even if task is cancelled
+struct CleanupGuard {
+    switch_id: String,
+    state: Arc<RwLock<ConnectionState>>,
+    writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        // Note: Can't use async in Drop, but we can spawn a cleanup task
+        let switch_id = self.switch_id.clone();
+        let state = self.state.clone();
+        let writer = self.writer.clone();
+        
+        tokio::spawn(async move {
+            // Mark connection as disconnected
+            *state.write().await = ConnectionState::Disconnected;
+            
+            // Attempt to flush writer
+            if let Ok(mut writer_guard) = writer.try_lock() {
+                let _ = writer_guard.flush().await;
+                debug!("Cleanup guard flushed writer for switch {}", switch_id);
+            }
+            
+            debug!("Cleanup guard executed for switch {}", switch_id);
+        });
+    }
 }
 
 /// Managed switch connection with flow transmission capability
@@ -269,6 +302,13 @@ impl ManagedConnection {
         state: Arc<RwLock<ConnectionState>>,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
+        // CRITICAL FIX #7: Cleanup guard for task cancellation safety
+        let _cleanup_guard = CleanupGuard {
+            switch_id: switch_id.clone(),
+            state: state.clone(),
+            writer: writer.clone(),
+        };
+
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -318,7 +358,15 @@ impl ManagedConnection {
             }
         }
 
+        // Explicit cleanup before drop
         *state.write().await = ConnectionState::Disconnected;
+        
+        // Flush writer before shutdown
+        if let Ok(mut writer_guard) = writer.lock().await {
+            let _ = writer_guard.flush().await;
+            debug!("Flushed writer for switch {}", switch_id);
+        }
+        
         info!("Message handler stopped for switch {}", switch_id);
     }
 
@@ -330,6 +378,13 @@ impl ManagedConnection {
         state: Arc<RwLock<ConnectionState>>,
         mut flow_rx: mpsc::Receiver<(FlowOperation, oneshot::Sender<Result<()>>)>,
     ) {
+        // CRITICAL FIX #7: Cleanup guard for task cancellation safety
+        let _cleanup_guard = CleanupGuard {
+            switch_id: switch_id.clone(),
+            state: state.clone(),
+            writer: writer.clone(),
+        };
+
         while let Some((operation, result_tx)) = flow_rx.recv().await {
             // CRITICAL FIX: Validate connection state before executing operation
             let current_state = *state.read().await;
@@ -371,6 +426,14 @@ impl ManagedConnection {
 
             // Send result back
             let _ = result_tx.send(result);
+        }
+
+        // Explicit cleanup: drain remaining operations
+        flow_rx.close();
+        while let Some((_, result_tx)) = flow_rx.recv().await {
+            let _ = result_tx.send(Err(ControllerError::ConnectionFailed(
+                "Flow handler shutting down".to_string(),
+            )));
         }
 
         info!("Flow operation handler stopped for switch {}", switch_id);
@@ -529,9 +592,20 @@ impl ManagedConnection {
     pub async fn send_flow_operation(&self, operation: FlowOperation) -> Result<()> {
         let (result_tx, result_rx) = oneshot::channel();
         
-        self.flow_tx
-            .send((operation, result_tx))
+        // CRITICAL FIX #8: Backpressure handling with timeout
+        // If queue is full, timeout instead of blocking forever
+        timeout(FLOW_SEND_TIMEOUT, self.flow_tx.send((operation, result_tx)))
             .await
+            .map_err(|_| {
+                warn!(
+                    "Flow operation queue full for switch {} - backpressure timeout",
+                    self.switch_id
+                );
+                ControllerError::ConnectionFailed(format!(
+                    "Flow operation queue full for switch {} (backpressure)",
+                    self.switch_id
+                ))
+            })?
             .map_err(|_| ControllerError::ConnectionFailed("Channel closed".to_string()))?;
 
         result_rx
